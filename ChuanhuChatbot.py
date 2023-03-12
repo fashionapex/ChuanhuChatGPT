@@ -45,7 +45,7 @@ with gr.Blocks(css=customCSS) as demo:
     gr.HTML(title)
     with gr.Row():
         keyTxt = gr.Textbox(show_label=False, placeholder=f"在这里输入你的OpenAI API-key...",
-                            value=my_api_key, type="password", visible=not HIDE_MY_KEY).style(container=True)
+                            value=my_api_key, type="password", visible=False).style(container=True)
         use_streaming_checkbox = gr.Checkbox(label="实时传输回答", value=True, visible=enable_streaming_option)
     chatbot = gr.Chatbot()  # .style(color_map=("#1D51EE", "#585A5B"))
     history = gr.State([])
@@ -139,7 +139,7 @@ with gr.Blocks(css=customCSS) as demo:
 
 print("川虎的温馨提示：访问 http://localhost:7860 查看界面")
 # 默认开启本地服务器，默认可以直接从IP访问，默认不创建公开分享链接
-demo.title = "川虎ChatGPT 🚀"
+demo.title = ""
 
 if __name__ == "__main__":
     #if running in Docker
