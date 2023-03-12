@@ -1,4 +1,4 @@
-title = """<h1 align="center">ChatGPT</h1>"""
+title = """"""
 description = """"""
 customCSS = """
 code {
