@@ -1,7 +1,4 @@
-"""Contains all of the components that can be used with Gradio Interface / Blocks.
-Along with the docs for each component, you can find the names of example demos that use
-each component. These demos are located in the `demo` directory."""
-
+# -*- coding:utf-8 -*-
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Tuple, Type
 import json
@@ -15,6 +12,9 @@ import csv
 import mdtex2html
 from pypinyin import lazy_pinyin
 from presets import *
+import tiktoken
+from tqdm import tqdm
+import colorama
 
 if TYPE_CHECKING:
     from typing import TypedDict
@@ -47,6 +47,11 @@ def postprocess(
                 None if response is None else mdtex2html.convert(response),
             )
         return y
+
+def count_token(input_str):
+    encoding = tiktoken.get_encoding("cl100k_base")
+    length = len(encoding.encode(input_str))
+    return length
 
 def parse_text(text):
     lines = text.split("\n")
@@ -92,8 +97,7 @@ def construct_assistant(text):
     return construct_text("assistant", text)
 
 def construct_token_message(token, stream=False):
-    extra = "【仅包含回答的计数】 " if stream else ""
-    return f"{extra}Token 计数: {token}"
+    return f"Token 计数: {token}"
 
 def get_response(openai_api_key, system_prompt, history, temperature, top_p, stream):
     headers = {
@@ -123,11 +127,20 @@ def get_response(openai_api_key, system_prompt, history, temperature, top_p, str
 def stream_predict(openai_api_key, system_prompt, history, inputs, chatbot, previous_token_count, top_p, temperature):
     def get_return_value():
         return chatbot, history, status_text, [*previous_token_count, token_counter]
+
+    print("实时回答模式")
     token_counter = 0
     partial_words = ""
     counter = 0
-    status_text = "OK"
+    status_text = "开始实时传输回答……"
     history.append(construct_user(inputs))
+    user_token_count = 0
+    if len(previous_token_count) == 0:
+        system_prompt_token_count = count_token(system_prompt)
+        user_token_count = count_token(inputs) + system_prompt_token_count
+    else:
+        user_token_count = count_token(inputs)
+    print(f"输入token计数: {user_token_count}")
     try:
         response = get_response(openai_api_key, system_prompt, history, temperature, top_p, True)
     except requests.exceptions.ConnectTimeout:
@@ -138,7 +151,7 @@ def stream_predict(openai_api_key, system_prompt, history, inputs, chatbot, prev
     chatbot.append((parse_text(inputs), ""))
     yield get_return_value()
 
-    for chunk in response.iter_lines():
+    for chunk in tqdm(response.iter_lines()):
         if counter == 0:
             counter += 1
             continue
@@ -151,11 +164,17 @@ def stream_predict(openai_api_key, system_prompt, history, inputs, chatbot, prev
             # decode each line as response data is in bytes
             if chunklength > 6 and "delta" in chunk['choices'][0]:
                 finish_reason = chunk['choices'][0]['finish_reason']
-                status_text = construct_token_message(sum(previous_token_count)+token_counter, stream=True)
+                status_text = construct_token_message(sum(previous_token_count)+token_counter+user_token_count, stream=True)
                 if finish_reason == "stop":
+                    print("生成完毕")
                     yield get_return_value()
                     break
-                partial_words = partial_words + chunk['choices'][0]["delta"]["content"]
+                try:
+                    partial_words = partial_words + chunk['choices'][0]["delta"]["content"]
+                except KeyError:
+                    status_text = standard_error_msg + "API回复中找不到内容。很可能是Token计数达到上限了。请重置对话。当前Token计数: " + str(sum(previous_token_count)+token_counter+user_token_count)
+                    yield get_return_value()
+                    break
                 if token_counter == 0:
                     history.append(construct_assistant(" " + partial_words))
                 else:
@@ -166,6 +185,7 @@ def stream_predict(openai_api_key, system_prompt, history, inputs, chatbot, prev
 
 
 def predict_all(openai_api_key, system_prompt, history, inputs, chatbot, previous_token_count, top_p, temperature):
+    print("一次性回答模式")
     history.append(construct_user(inputs))
     try:
         response = get_response(openai_api_key, system_prompt, history, temperature, top_p, False)
@@ -179,22 +199,29 @@ def predict_all(openai_api_key, system_prompt, history, inputs, chatbot, previou
     total_token_count = response["usage"]["total_tokens"]
     previous_token_count.append(total_token_count - sum(previous_token_count))
     status_text = construct_token_message(total_token_count)
+    print("生成一次性回答完毕")
     return chatbot, history, status_text, previous_token_count
 
 
 def predict(openai_api_key, system_prompt, history, inputs, chatbot, token_count, top_p, temperature, stream=False, should_check_token_count = True):  # repetition_penalty, top_k
+    print("输入为：" +colorama.Fore.BLUE + f"{inputs}" + colorama.Style.RESET_ALL)
     if stream:
+        print("使用流式传输")
         iter = stream_predict(openai_api_key, system_prompt, history, inputs, chatbot, token_count, top_p, temperature)
         for chatbot, history, status_text, token_count in iter:
             yield chatbot, history, status_text, token_count
     else:
+        print("不使用流式传输")
         chatbot, history, status_text, token_count = predict_all(openai_api_key, system_prompt, history, inputs, chatbot, token_count, top_p, temperature)
         yield chatbot, history, status_text, token_count
+    print(f"传输完毕。当前token计数为{token_count}")
+    print("回答为：" +colorama.Fore.BLUE + f"{history[-1]['content']}" + colorama.Style.RESET_ALL)
     if stream:
         max_token = max_token_streaming
     else:
         max_token = max_token_all
     if sum(token_count) > max_token and should_check_token_count:
+        print(f"精简token中{token_count}/{max_token}")
         iter = reduce_token_size(openai_api_key, system_prompt, history, chatbot, token_count, top_p, temperature, stream=False, hidden=True)
         for chatbot, history, status_text, token_count in iter:
             status_text = f"Token 达到上限，已自动降低Token计数至 {status_text}"
@@ -202,6 +229,7 @@ def predict(openai_api_key, system_prompt, history, inputs, chatbot, token_count
 
 
 def retry(openai_api_key, system_prompt, history, chatbot, token_count, top_p, temperature, stream=False):
+    print("重试中……")
     if len(history) == 0:
         yield chatbot, history, f"{standard_error_msg}上下文是空的", token_count
         return
@@ -209,11 +237,13 @@ def retry(openai_api_key, system_prompt, history, chatbot, token_count, top_p, t
     inputs = history.pop()["content"]
     token_count.pop()
     iter = predict(openai_api_key, system_prompt, history, inputs, chatbot, token_count, top_p, temperature, stream=stream)
+    print("重试完毕")
     for x in iter:
         yield x
 
 
 def reduce_token_size(openai_api_key, system_prompt, history, chatbot, token_count, top_p, temperature, stream=False, hidden=False):
+    print("开始减少token数量……")
     iter = predict(openai_api_key, system_prompt, history, summarize_prompt, chatbot, token_count, top_p, temperature, stream=stream, should_check_token_count=False)
     for chatbot, history, status_text, previous_token_count in iter:
         history = history[-2:]
@@ -221,23 +251,29 @@ def reduce_token_size(openai_api_key, system_prompt, history, chatbot, token_cou
         if hidden:
             chatbot.pop()
         yield chatbot, history, construct_token_message(sum(token_count), stream=stream), token_count
+    print("减少token数量完毕")
 
 
 def delete_last_conversation(chatbot, history, previous_token_count, streaming):
     if len(chatbot) > 0 and standard_error_msg in chatbot[-1][1]:
+        print("由于包含报错信息，只删除chatbot记录")
         chatbot.pop()
         return chatbot, history
     if len(history) > 0:
+        print("删除了一组对话历史")
         history.pop()
         history.pop()
     if len(chatbot) > 0:
+        print("删除了一组chatbot对话")
         chatbot.pop()
     if len(previous_token_count) > 0:
+        print("删除了一组对话的token计数记录")
         previous_token_count.pop()
     return chatbot, history, previous_token_count, construct_token_message(sum(previous_token_count), streaming)
 
 
 def save_chat_history(filename, system, history, chatbot):
+    print("保存对话历史中……")
     if filename == "":
         return
     if not filename.endswith(".json"):
@@ -247,30 +283,39 @@ def save_chat_history(filename, system, history, chatbot):
     print(json_s)
     with open(os.path.join(HISTORY_DIR, filename), "w") as f:
         json.dump(json_s, f)
+    print("保存对话历史完毕")
 
 
 def load_chat_history(filename, system, history, chatbot):
+    print("加载对话历史中……")
     try:
         with open(os.path.join(HISTORY_DIR, filename), "r") as f:
             json_s = json.load(f)
-        if type(json_s["history"]) == list:
-            new_history = []
-            for index, item in enumerate(json_s["history"]):
-                if index % 2 == 0:
-                    new_history.append(construct_user(item))
-                else:
-                    new_history.append(construct_assistant(item))
-            json_s["history"] = new_history
+        try:
+            if type(json_s["history"][0]) == str:
+                print("历史记录格式为旧版，正在转换……")
+                new_history = []
+                for index, item in enumerate(json_s["history"]):
+                    if index % 2 == 0:
+                        new_history.append(construct_user(item))
+                    else:
+                        new_history.append(construct_assistant(item))
+                json_s["history"] = new_history
+                print(new_history)
+        except:
+            # 没有对话历史
+            pass
+        print("加载对话历史完毕")
         return filename, json_s["system"], json_s["history"], json_s["chatbot"]
     except FileNotFoundError:
-        print("File not found.")
+        print("没有找到对话历史文件，不执行任何操作")
         return filename, system, history, chatbot
 
 def sorted_by_pinyin(list):
     return sorted(list, key=lambda char: lazy_pinyin(char)[0][0])
 
 def get_file_names(dir, plain=False, filetypes=[".json"]):
-    # find all json files in the current directory and return their names
+    print(f"获取文件名列表，目录为{dir}，文件类型为{filetypes}，是否为纯文本列表{plain}")
     files = []
     try:
         for type in filetypes:
@@ -286,9 +331,11 @@ def get_file_names(dir, plain=False, filetypes=[".json"]):
         return gr.Dropdown.update(choices=files)
 
 def get_history_names(plain=False):
+    print("获取历史记录文件名列表")
     return get_file_names(HISTORY_DIR, plain)
 
 def load_template(filename, mode=0):
+    print(f"加载模板文件{filename}，模式为{mode}（0为返回字典和下拉菜单，1为返回下拉菜单，2为返回字典）")
     lines = []
     print("Loading template...")
     if filename.endswith(".json"):
@@ -309,24 +356,19 @@ def load_template(filename, mode=0):
         return {row[0]:row[1] for row in lines}, gr.Dropdown.update(choices=choices, value=choices[0])
 
 def get_template_names(plain=False):
+    print("获取模板文件名列表")
     return get_file_names(TEMPLATES_DIR, plain, filetypes=[".csv", "json"])
 
 def get_template_content(templates, selection, original_system_prompt):
+    print(f"应用模板中，选择为{selection}，原始系统提示为{original_system_prompt}")
     try:
         return templates[selection]
     except:
         return original_system_prompt
 
 def reset_state():
+    print("重置状态")
     return [], [], [], construct_token_message(0)
-
-def compose_system(system_prompt):
-    return {"role": "system", "content": system_prompt}
-
-
-def compose_user(user_input):
-    return {"role": "user", "content": user_input}
-
 
 def reset_textbox():
     return gr.update(value='')
